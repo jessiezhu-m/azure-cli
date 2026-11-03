@@ -138,13 +138,15 @@ az cognitiveservices account create \
 
 ### 4.1 Preflight Checks
 
+For an existing Account, validate location, hosting configuration and any supplied new or changed custom domain, then skip dependency checks and provisioning.
+
 Preflight is read-only and completes before any Azure writes. Report each check's name, resource/scope, observed/expected state, missing evidence, and remediation with `PASS`, `FAIL`, `UNVERIFIED`, or `NOT_APPLICABLE`. Mandatory `FAIL`/`UNVERIFIED` stops provisioning.
 
 1. **Inputs and resources**: Validate resource IDs once in `custom.create()`; distinguish malformed, absent and unreadable resources. The target RG must exist; missing RG fails before writes, and read/authentication errors are not treated as absence. Account, AKS and Storage must share a subscription and region; UAMIs may differ, but referenced hosting resources must share a tenant. Require non-empty `principalId` on both UAMIs and `clientId`/`tenantId` on Workload UAMI; check reused identities during preflight and new identities after creation. For planned resources, check request properties and permissions at the existing RG, not GETs on future resources.
 2. **AKS cluster**: Require Standard AKS (no pricing-tier restriction), Kubernetes >= 1.31, managed identity, readable OIDC issuer, Workload Identity, and `Succeeded` state; reject Automatic/Arc. Require `networkPlugin=azure` and `networkPluginMode=overlay`. Reject kubenet and non-Overlay networking; check network policy separately under A11. Do not modify the cluster.
 3. **Node pools**: Require a `Succeeded` System pool with >= 4 vCPU / 16 GiB. One User pool must simultaneously satisfy Azure Linux, `KataVmIsolation`, >= 1 current node, >= 8 vCPU / 32 GiB, image `AKSAzureLinux-V3katagen2-202608.14.0` or later in the same series, case-sensitive label `agents.ai.azure.com/sandbox-node=true`, disabled SSH, and `Succeeded` state. Autoscaling capacity does not replace the current-node requirement. Read AgentPool child resources; never combine different pools' partial results. Recommended VM SKU names are not hard requirements.
-4. **Supplied Storage**: Require the Account region, StorageV2/Hot, HNS disabled, HTTPS only, TLS >= 1.2, shared keys and anonymous Blob disabled, and a valid HTTPS Blob endpoint. Missing/unknown zone redundancy only warns. The public-network baseline requires `publicNetworkAccess=Enabled` and firewall `defaultAction=Allow`; private/restricted Storage is `NOT_APPLICABLE` for this check, with an unverified-network warning, and may continue. API/read/endpoint failures still block.
-5. **Permissions**: Check required reads, Account creation, Hosting UAMI assign/action and omitted UAMI/Storage creation. Determine creation permissions from omitted inputs, not failed reads; use each target ARM ID's RG when the resource is absent and deduplicate the shared UAMI creation check. Workload UAMI needs no operator assign/action; G02 covers its FIC-management grant. Require `roleAssignments/write` at the actual resource or target RG only for Assignment branches below. Retain `Microsoft.ContainerService/managedClusters/write` at the AKS parent RG; remove RG-creation and VNet-write checks.
+4. **Supplied Storage**: Require the Account region, StorageV2/Hot, HNS disabled, HTTPS only, TLS >= 1.2, shared keys and anonymous Blob disabled, and a valid HTTPS Blob endpoint. Missing/unknown zone redundancy only warns. The public-network baseline requires `publicNetworkAccess=Enabled` and firewall `defaultAction=Allow`; private/restricted Storage is `NOT_APPLICABLE` for this check, with an informational note that connectivity is unverified, and may continue. API/read/endpoint failures still block.
+5. **Permissions**: Check required reads, Account creation, Hosting UAMI assign/action and omitted UAMI/Storage creation. Determine creation permissions from omitted inputs, not failed reads; use each target ARM ID's RG when the resource is absent and deduplicate the shared UAMI creation check. Workload UAMI needs no operator assign/action; G02 covers its FIC-management grant. Require `roleAssignments/write` at the actual resource or target RG only for Assignment branches below. Retain `Microsoft.ContainerService/managedClusters/write` at the AKS resource scope; remove RG-creation and VNet-write checks.
 
 Use ARM `permissions.list_for_resource_group` / `list_for_resource` for operator permissions, matching concrete Actions case-insensitively after each Permission's NotActions. Do not decode login tokens or resolve operator groups locally. These APIs describe the caller, not UAMIs: preserve MI validation using actual principal IDs, inherited assignments, role definitions, Actions/NotActions and DataActions/NotDataActions. G03 Blob access cannot be inferred from management-plane permissions. Exclusions are local to each grant. Missing/unverifiable permission blocks writes; Validation branches never repair grants. Require unconditional grants without claiming full evaluation of conditions, deny assignments, tenant policy or RBAC propagation.
 
@@ -195,9 +197,9 @@ The SDK create request must match the Storage resource configuration in the supp
 
 During preflight, list the subscription's Microsoft.Storage SKUs. Set `plan.storageSku` to `Standard_ZRS` when StorageV2 ZRS is available without a matching location restriction; otherwise use `Standard_LRS`. This applies only to auto-created Storage. Do not change supplied Storage or switch SKU after a creation error.
 
-#### Resource Naming (Proposed; Pending Meeting Discussion)
+#### Resource Naming
 
-For CLI-created Storage, Hosting MI, and Workload MI, use the following Account-based names initially; final naming remains subject to meeting discussion.
+For CLI-created Storage, Hosting MI, and Workload MI, use the following Account-based names.
 
 ```text
 accountPart = lowercase(foundryAccountName), retaining only ASCII a-z/0-9
@@ -210,7 +212,7 @@ Workload MI = lowercase(foundryAccountName) + "-workload-mi"
 
 For account `team-ai-prod` and illustrative token `a1b2c3d4e5`:
 
-| Resource | Proposed Default Name |
+| Resource | Default Name |
 | :--- | :--- |
 | Storage | `teamaiproda1b2c3d4e5` |
 | Hosting MI | `team-ai-prod-hosting-mi` |
@@ -234,14 +236,15 @@ Validation branches perform no grant writes and require no operator `roleAssignm
 
 Keep deterministic `uuid.uuid5` assignment names. A 409 is successful only for `RoleAssignmentExists` followed by a readable assignment with matching principal, role and exact scope, without a conflicting condition. Otherwise re-raise the original error.
 
-### 4.3 Errors and Partial Provisioning
+### 4.3 Errors, Retry, and Partial Provisioning
 
 * Preserve service errors and correlation IDs. Resource/grant creation completion does not prove RBAC data-plane propagation.
 * Log resource/grant IDs before writes, reused resources, and dependency IDs before Account submission. On dependency failure, warn about partial completion and re-raise the original error. Return the Account SDK poller unchanged.
 * No local journal, ownership ledger, recovery file, automatic rollback or deletion. Preserve supplied/reused resources, customer grants and unrelated RG contents; deterministic names do not prove ownership.
-* Deterministic names and compatible grants support reuse, not full recovery. Inspect Azure state before retrying.
+* Basic idempotency supports retrying with the same command inputs after a failure. Deterministic names allow existing dependencies that pass preflight to be reused without resource updates. Assignment branches reuse compatible grants and create missing grants; Validation branches report missing permissions without changing grants.
+* Use the resource IDs in the console logs to inspect partial completion and handle resources that need attention before retrying. Resources are retained for reuse or manual cleanup.
 
-**TODO - Recovery design**: Define interrupted/active/concurrent attempt handling, completion and ownership reconciliation, Account poller outcomes and cleanup UX. Recovery is not implemented.
+**Scope**: Failure retry, dependency/grant reuse, resource-ID logging, and retaining resources without automatic deletion are supported by this change. Generic Account creation and poller recovery, concurrent attempt coordination, and automated cleanup are outside this change's scope.
 
 ---
 
@@ -268,5 +271,5 @@ Keep deterministic `uuid.uuid5` assignment names. A 409 is successful only for `
 * **Permissions**: Cover all eight dependency combinations, ARM caller permission scopes/errors and MI wildcard/DataAction semantics. Verify compatible 409 recovery and propagation of all other conflicts.
 * **Storage Configuration**: Verify all auto-created Storage fields, user-tag propagation, ZRS preference with LRS fallback, and supplied Storage region validation; supplied Storage causes no Storage create/update.
 * **Provisioning**: Verify SDK resource/grant completion and actual IDs before Account submission, no deployment submission, and no dependency writes when all supplied resources pass Validation and the RG exists. Project creation stays separate and performs no ACR operations.
-* **Partial Failure**: Verify stable reuse, resource-ID logs, original errors and no automatic deletion. Recovery remains TODO.
+* **Retry and Partial Failure**: Verify stable dependency/grant reuse when retrying with the same inputs, resource-ID logs, original errors and no automatic deletion.
 * **Checks**: `azdev style cognitiveservices`, `azdev linter cognitiveservices`, and `azdev test test_agent_hosting test_agent_hosting_preparation --discover`.
